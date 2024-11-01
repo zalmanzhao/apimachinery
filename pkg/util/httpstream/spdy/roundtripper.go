@@ -61,6 +61,10 @@ type SpdyRoundTripper struct {
 	// Dialer is the dialer used to connect.  Used if non-nil.
 	Dialer *net.Dialer
 
+	// DialContext is the function used to create new underlying connections. Optional, if not specified
+	// Dialer is used.
+	DialContext func(ctx context.Context, network, address string) (net.Conn, error)
+
 	// proxier knows which proxy to use given a request, defaults to http.ProxyFromEnvironment
 	// Used primarily for mocking the proxy discovery in tests.
 	proxier func(req *http.Request) (*url.URL, error)
@@ -113,6 +117,9 @@ type RoundTripperConfig struct {
 	// PingPeriod is a period for sending SPDY Pings on the connection.
 	// Optional.
 	PingPeriod time.Duration
+	// DialContext is the function used to create new underlying connections. Optional, if not specified
+	// Dialer is used.
+	DialContext func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 // TLSClientConfig implements pkg/util/net.TLSClientConfigHolder for proper TLS checking during
@@ -202,6 +209,20 @@ func (s *SpdyRoundTripper) dialWithHttpProxy(req *http.Request, proxyURL *url.UR
 	return rwc, nil
 }
 
+var _ = (proxy.ContextDialer)((*fnDialer)(nil))
+var _ = (proxy.Dialer)((*fnDialer)(nil))
+
+type fnDialer struct {
+	fn func(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+func (f fnDialer) Dial(network, addr string) (c net.Conn, err error) {
+	return f.fn(context.Background(), network, addr)
+}
+func (f fnDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return f.fn(ctx, network, addr)
+}
+
 // dialWithSocks5Proxy dials the host specified by url through a socks5 proxy.
 func (s *SpdyRoundTripper) dialWithSocks5Proxy(req *http.Request, proxyURL *url.URL) (net.Conn, error) {
 	// ensure we use a canonical host with proxyReq
@@ -217,11 +238,13 @@ func (s *SpdyRoundTripper) dialWithSocks5Proxy(req *http.Request, proxyURL *url.
 		}
 	}
 
-	dialer := s.Dialer
-	if dialer == nil {
-		dialer = &net.Dialer{
-			Timeout: 30 * time.Second,
-		}
+	var dialer proxy.Dialer = &net.Dialer{
+		Timeout: 30 * time.Second,
+	}
+	if s.DialContext != nil {
+		dialer = fnDialer{s.DialContext}
+	} else if s.Dialer != nil {
+		dialer = s.Dialer
 	}
 
 	proxyDialer, err := proxy.SOCKS5("tcp", proxyDialAddr, auth, dialer)
@@ -276,20 +299,65 @@ func (s *SpdyRoundTripper) tlsConn(ctx context.Context, rwc net.Conn, targetHost
 // dialWithoutProxy dials the host specified by url, using TLS if appropriate.
 func (s *SpdyRoundTripper) dialWithoutProxy(ctx context.Context, url *url.URL) (net.Conn, error) {
 	dialAddr := netutil.CanonicalAddr(url)
-	dialer := s.Dialer
-	if dialer == nil {
-		dialer = &net.Dialer{}
-	}
 
 	if url.Scheme == "http" {
-		return dialer.DialContext(ctx, "tcp", dialAddr)
+		if s.DialContext == nil && s.Dialer == nil {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", dialAddr)
+		} else if s.DialContext != nil {
+			return s.DialContext(ctx, "tcp", dialAddr)
+		} else {
+			return s.Dialer.DialContext(ctx, "tcp", dialAddr)
+		}
 	}
 
-	tlsDialer := tls.Dialer{
-		NetDialer: dialer,
-		Config:    s.tlsConfig,
+	var conn *tls.Conn
+	var err error
+	if s.DialContext == nil && s.Dialer == nil {
+		conn, err = tls.Dial("tcp", dialAddr, s.tlsConfig)
+	} else if s.DialContext != nil {
+		conn, err = s.TLSDialWithDialer(ctx, s.DialContext, "tcp", dialAddr, s.tlsConfig)
+	} else {
+		conn, err = tls.DialWithDialer(s.Dialer, "tcp", dialAddr, s.tlsConfig)
 	}
-	return tlsDialer.DialContext(ctx, "tcp", dialAddr)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
+// TLSDialWithDialer dial a tls conntion with dialer, the code mostly copy from tls package.
+func (s *SpdyRoundTripper) TLSDialWithDialer(ctx context.Context, dialer func(ctx context.Context, network, address string) (net.Conn, error), network, addr string, config *tls.Config) (*tls.Conn, error) {
+	rawConn, err := dialer(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	colonPos := strings.LastIndex(addr, ":")
+	if colonPos == -1 {
+		colonPos = len(addr)
+	}
+	hostname := addr[:colonPos]
+
+	if config == nil {
+		config = &tls.Config{}
+	}
+	// If no ServerName is set, infer the ServerName
+	// from the hostname we're connecting to.
+	if config.ServerName == "" {
+		// Make a copy to avoid polluting argument or default.
+		c := config.Clone()
+		c.ServerName = hostname
+		config = c
+	}
+
+	conn := tls.Client(rawConn, config)
+	if err := conn.HandshakeContext(ctx); err != nil {
+		rawConn.Close()
+		return nil, err
+	}
+	return conn, nil
+
 }
 
 // proxyAuth returns, for a given proxy URL, the value to be used for the Proxy-Authorization header
